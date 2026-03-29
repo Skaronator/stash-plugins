@@ -1169,14 +1169,32 @@
   function OssmSceneDetailsPanel() {
     var snapshot = useRuntimeSnapshot();
     var settings = snapshot.settings;
+    var action = navbarAction(snapshot);
 
     return h('section', { className: 'container ossm-scene-panel' }, [
       h('div', { className: 'row form-group', key: 'header' }, [
         h('span', { className: 'col-12 d-flex align-items-center justify-content-between', key: 'header-col' }, [
           h('h5', { className: 'mb-0', key: 'title' }, 'OSSM'),
-          h('span', { className: statusClass(snapshot.connectionStatus, snapshot.error), key: 'status' }, [
-            h('span', { className: 'ossm-status__dot', key: 'dot' }),
-            h('span', { key: 'label' }, statusLabel(snapshot)),
+          h('span', { className: 'd-flex align-items-center ossm-scene-panel__header-actions', key: 'controls' }, [
+            h('span', { className: statusClass(snapshot.connectionStatus, snapshot.error), key: 'status' }, [
+              h('span', { className: 'ossm-status__dot', key: 'dot' }),
+              h('span', { key: 'label' }, statusLabel(snapshot)),
+            ]),
+            h(
+              'button',
+              {
+                className: 'btn btn-primary btn-sm',
+                disabled: action === 'connecting' || action === 'unsupported',
+                key: 'connect-button',
+                onClick: function onClick() {
+                  runNavbarAction(snapshot).catch(function ignore() {
+                    return null;
+                  });
+                },
+                type: 'button',
+              },
+              navbarActionLabel(snapshot)
+            ),
           ]),
         ]),
       ]),

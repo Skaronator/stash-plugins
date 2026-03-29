@@ -145,6 +145,10 @@
   gap: 0.5rem;
 }
 
+.ossm-scene-panel__header-actions {
+  gap: 0.5rem;
+}
+
 @keyframes ossm-pulse {
   0%,
   100% {

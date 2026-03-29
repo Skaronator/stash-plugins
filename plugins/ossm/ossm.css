@@ -161,9 +161,3 @@
     transform: scale(0.86);
   }
 }
-
-@media (max-width: 767.98px) {
-  .ossm-scene-panel__stats {
-    grid-template-columns: repeat(1, minmax(0, 1fr));
-  }
-}

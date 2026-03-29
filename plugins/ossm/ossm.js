@@ -6,9 +6,9 @@
 
   var React = PluginApi.React;
   var h = React.createElement;
-  var ReactRouterDOM = PluginApi.libraries.ReactRouterDOM || {};
-  var Link = ReactRouterDOM.Link;
-  var NavLink = ReactRouterDOM.NavLink;
+  var Bootstrap = PluginApi.libraries.Bootstrap || {};
+  var BootstrapNav = Bootstrap.Nav;
+  var BootstrapTab = Bootstrap.Tab;
   var useEffect = React.useEffect;
   var useState = React.useState;
   var useSyncExternalStore = React.useSyncExternalStore;
@@ -106,13 +106,6 @@
     return parts[parts.length - 1] || clean;
   }
 
-  function formatMs(ms) {
-    var totalSeconds = Math.max(0, Math.floor((ms || 0) / 1000));
-    var minutes = Math.floor(totalSeconds / 60);
-    var seconds = totalSeconds % 60;
-    return String(minutes) + ':' + String(seconds).padStart(2, '0');
-  }
-
   function parseCsvScript(content) {
     return String(content || '')
       .split(/\r?\n/)
@@ -203,6 +196,18 @@
       simpleActions: buildSimpleActions(actions),
       metadata: parsed && typeof parsed === 'object' ? parsed : {},
     };
+  }
+
+  function getCurrentActionCount(snapshot) {
+    if (!snapshot) {
+      return 0;
+    }
+
+    if (snapshot.settings && snapshot.settings.simpleMode) {
+      return snapshot.simpleActionCount || 0;
+    }
+
+    return snapshot.actionCount || 0;
   }
 
   function createRuntimeStore() {
@@ -749,6 +754,18 @@
       return Promise.resolve();
     }
 
+    function stop() {
+      stopSync();
+
+      if (state.connectionStatus !== 'connected') {
+        return Promise.resolve();
+      }
+
+      return sendCommand('set:speed:0').then(function onStop() {
+        addLog('INFO', 'Stopped active OSSM playback');
+      });
+    }
+
     function ensurePlaying(positionSeconds) {
       if (!state.isPlaying) {
         return play(positionSeconds);
@@ -768,12 +785,6 @@
       return Promise.resolve();
     }
 
-    function sendTestPosition(position) {
-      return connect().then(function onConnected() {
-        return sendStreamPosition(position, 500);
-      });
-    }
-
     window.addEventListener('beforeunload', function onUnload() {
       stopSync();
     });
@@ -787,6 +798,7 @@
       loadScript: loadScript,
       play: play,
       pause: pause,
+      stop: stop,
       ensurePlaying: ensurePlaying,
       setLooping: setLooping,
       updateSettings: updateSettings,
@@ -794,7 +806,6 @@
         setState({ logs: [] });
       },
       clearError: clearError,
-      sendTestPosition: sendTestPosition,
       sync: function sync() {
         return Promise.resolve(0);
       },
@@ -858,6 +869,10 @@
 
   OssmInteractiveClient.prototype.pause = function pause() {
     return this._store.pause();
+  };
+
+  OssmInteractiveClient.prototype.stop = function stop() {
+    return this._store.stop();
   };
 
   OssmInteractiveClient.prototype.ensurePlaying = function ensurePlaying(position) {
@@ -958,24 +973,6 @@
     return snapshot;
   }
 
-  function Card(props) {
-    return h('section', { className: 'card h-100 ' + (props.className || '') }, [
-      props.title
-        ? h(
-            'div',
-            { className: 'card-header d-flex flex-wrap align-items-center justify-content-between', key: 'head' },
-            [
-              h(props.headingTag || 'h2', { className: 'h5 mb-0', key: 'title' }, props.title),
-              props.actions
-                ? h('div', { className: 'd-flex flex-wrap align-items-center', key: 'actions' }, props.actions)
-                : null,
-            ]
-          )
-        : null,
-      h('div', { className: 'card-body ' + (props.bodyClassName || ''), key: 'body' }, props.children),
-    ]);
-  }
-
   function Stat(props) {
     return h('div', { className: 'ossm-stat', key: 'body' }, [
       h('div', { className: 'text-muted small text-uppercase font-weight-bold mb-1', key: 'label' }, props.label),
@@ -998,31 +995,6 @@
         value: props.value,
       }),
       props.help ? h('small', { className: 'form-text text-muted mt-1 mb-0', key: 'help' }, props.help) : null,
-    ]);
-  }
-
-  function RangeField(props) {
-    return h('div', { className: 'form-group mb-0 ossm-field' }, [
-      h('label', { className: 'mb-1', htmlFor: props.id, key: 'label' }, props.label),
-      props.help ? h('small', { className: 'form-text text-muted mt-0 mb-1', key: 'help' }, props.help) : null,
-      h('div', { className: 'ossm-range-wrap d-flex align-items-center', key: 'wrap' }, [
-        h('input', {
-          className: 'custom-range ossm-range',
-          disabled: props.disabled,
-          id: props.id,
-          max: props.max,
-          min: props.min,
-          onChange: props.onChange,
-          step: props.step || 1,
-          type: 'range',
-          value: props.value,
-        }),
-        h(
-          'span',
-          { className: 'text-muted small ml-2 ossm-range-value', key: 'value' },
-          String(props.value) + props.suffix
-        ),
-      ]),
     ]);
   }
 
@@ -1117,426 +1089,219 @@
     return 'ossm-nav__dot';
   }
 
+  function navbarAction(snapshot) {
+    if (!snapshot.supported) {
+      return 'unsupported';
+    }
+
+    if (snapshot.connectionStatus === 'connecting') {
+      return 'connecting';
+    }
+
+    if (snapshot.connectionStatus === 'connected') {
+      return snapshot.isPlaying ? 'stop' : 'disconnect';
+    }
+
+    return 'connect';
+  }
+
+  function navbarActionLabel(snapshot) {
+    var action = navbarAction(snapshot);
+    if (action === 'connecting') {
+      return 'Connecting';
+    }
+    if (action === 'stop') {
+      return 'Stop';
+    }
+    if (action === 'disconnect') {
+      return 'Disconnect';
+    }
+    if (action === 'unsupported') {
+      return 'Unavailable';
+    }
+    return 'Connect';
+  }
+
+  function runNavbarAction(snapshot) {
+    var action = navbarAction(snapshot);
+    if (action === 'connect') {
+      return runtime.connect();
+    }
+    if (action === 'stop') {
+      return runtime.stop();
+    }
+    if (action === 'disconnect') {
+      return runtime.disconnect();
+    }
+    return Promise.resolve();
+  }
+
   function OssmNavButton() {
     var snapshot = useRuntimeSnapshot();
 
-    if (!NavLink) {
-      return null;
-    }
+    var action = navbarAction(snapshot);
 
     return h(
-      NavLink,
-      {
-        className: 'nav-utility ossm-nav__link',
-        exact: true,
-        title: 'Open OSSM controls',
-        to: '/plugin/ossm',
-      },
+      'div',
+      { className: 'nav-link nav-utility' },
       h(
         'button',
         {
-          className: 'minimal d-flex align-items-center h-100 ossm-nav__button',
+          className:
+            'minimal p-4 p-xl-2 d-flex d-xl-inline-block flex-column justify-content-between align-items-center btn btn-primary ossm-nav__button',
+          disabled: action === 'connecting' || action === 'unsupported',
+          onClick: function onClick() {
+            runNavbarAction(snapshot).catch(function ignore() {
+              return null;
+            });
+          },
+          title: 'OSSM ' + navbarActionLabel(snapshot),
           type: 'button',
         },
         [
           h('span', { className: navbarStatusClass(snapshot), key: 'dot' }),
-          h('span', { className: 'ossm-nav__label', key: 'label' }, 'OSSM'),
+          h('span', { key: 'label' }, navbarActionLabel(snapshot)),
         ]
       )
     );
   }
 
-  function OssmPage() {
+  function OssmSceneDetailsPanel() {
     var snapshot = useRuntimeSnapshot();
     var settings = snapshot.settings;
-    var connected = snapshot.connectionStatus === 'connected';
-    var showUsage = !isOssmConnectionKey(snapshot.connectionKey);
-    var scriptOffsetCopy = snapshot.scriptOffsetMs === 0 ? '0 ms' : String(snapshot.scriptOffsetMs) + ' ms';
-    var totalOffsetCopy = String(snapshot.scriptOffsetMs + settings.fineOffsetMs + settings.bufferMs) + ' ms';
 
-    var usageLink = Link
-      ? h(Link, { className: 'btn btn-secondary btn-sm', to: '/settings?tab=interface' }, 'Open Interface Settings')
-      : null;
-
-    return h('div', { className: 'ossm-page' }, [
-      h('div', { className: 'ossm-shell', key: 'shell' }, [
-        h(
-          'header',
-          { className: 'ossm-hero d-flex flex-wrap justify-content-between align-items-start mb-3', key: 'hero' },
-          [
-            h('div', { key: 'copy' }, [
+    return h('section', { className: 'container ossm-scene-panel' }, [
+      h('div', { className: 'row form-group', key: 'header' }, [
+        h('span', { className: 'col-12 d-flex align-items-center justify-content-between', key: 'header-col' }, [
+          h('h5', { className: 'mb-0', key: 'title' }, 'OSSM'),
+          h('span', { className: statusClass(snapshot.connectionStatus, snapshot.error), key: 'status' }, [
+            h('span', { className: 'ossm-status__dot', key: 'dot' }),
+            h('span', { key: 'label' }, statusLabel(snapshot)),
+          ]),
+        ]),
+      ]),
+      h('div', { className: 'ossm-meta ossm-scene-panel__stats', key: 'stats' }, [
+        h(Stat, {
+          key: 'position',
+          label: 'Position',
+          value: String(snapshot.currentPosition || 0) + '%',
+        }),
+        h(Stat, {
+          key: 'actions',
+          label: 'Actions',
+          value: String(getCurrentActionCount(snapshot)),
+        }),
+        h(Stat, {
+          key: 'sent',
+          label: 'Sent',
+          value: String(snapshot.commandsSent || 0),
+        }),
+      ]),
+      h('div', { className: 'mt-3', key: 'timing-behavior' }, [
+        h('h5', { className: 'mb-3', key: 'timing-title' }, 'Timing & Behavior'),
+        h('div', { className: 'ossm-field-grid', key: 'timing-fields' }, [
+          h(NumberField, {
+            help: 'Fine tune playback on top of the Stash interface offset. Positive values send commands later.',
+            id: 'ossm-scene-fine-offset',
+            key: 'offset',
+            label: 'Fine Offset (ms)',
+            max: 5000,
+            min: -5000,
+            onChange: function onChange(event) {
+              runtime.updateSettings({ fineOffsetMs: toInteger(event.target.value, 0) }, false);
+            },
+            value: settings.fineOffsetMs,
+          }),
+          h(NumberField, {
+            help: 'Extra delay also pushed into the OSSM buffer command. The sample player uses this to give the device time to receive the next movement.',
+            id: 'ossm-scene-buffer',
+            key: 'buffer',
+            label: 'Buffer (ms)',
+            max: 1000,
+            min: 0,
+            onChange: function onChange(event) {
+              runtime.updateSettings({ bufferMs: clamp(toInteger(event.target.value, 0), 0, 1000) }, true);
+            },
+            value: settings.bufferMs,
+          }),
+          h(ToggleField, {
+            checked: settings.simpleMode,
+            help: 'Send only turning points instead of every funscript action.',
+            id: toggleId('scene-simple-mode'),
+            key: 'simple',
+            label: 'Simple Mode',
+            onChange: function onChange(event) {
+              runtime.updateSettings({ simpleMode: Boolean(event.target.checked) }, false);
+            },
+          }),
+          h(ToggleField, {
+            checked: settings.reverse,
+            help: 'Invert outgoing stream positions without modifying the funscript itself.',
+            id: toggleId('scene-reverse-motion'),
+            key: 'reverse',
+            label: 'Reverse Motion',
+            onChange: function onChange(event) {
+              runtime.updateSettings({ reverse: Boolean(event.target.checked) }, false);
+            },
+          }),
+          h(ToggleField, {
+            checked: settings.speedKnobAsLimit,
+            help: 'Keep the physical OSSM speed knob as an upper limit for BLE speed commands.',
+            id: toggleId('scene-use-speed-knob-as-limit'),
+            key: 'knob-limit',
+            label: 'Use Speed Knob As Limit',
+            onChange: function onChange(event) {
+              runtime.updateSettings({ speedKnobAsLimit: Boolean(event.target.checked) }, true);
+            },
+          }),
+          h(ToggleField, {
+            checked: settings.latencyCompensation,
+            help: 'Enable the OSSM latency compensation characteristic for streamed commands.',
+            id: toggleId('scene-latency-compensation'),
+            key: 'latency',
+            label: 'Latency Compensation',
+            onChange: function onChange(event) {
+              runtime.updateSettings({ latencyCompensation: Boolean(event.target.checked) }, true);
+            },
+          }),
+        ]),
+      ]),
+      h('details', { className: 'ossm-scene-panel__debug mt-3', key: 'logs' }, [
+        h('summary', { className: 'ossm-scene-panel__debug-summary', key: 'summary' }, 'Debug Logs'),
+        h('div', { className: 'mt-2', key: 'debug-content' }, [
+          snapshot.error ? h('div', { className: 'alert alert-danger mb-2', key: 'error' }, snapshot.error) : null,
+          h(
+            'div',
+            {
+              className: 'd-flex flex-wrap align-items-center mb-2 ossm-scene-panel__debug-actions',
+              key: 'actions',
+            },
+            [
               h(
-                'div',
-                { className: 'ossm-kicker text-muted small text-uppercase font-weight-bold', key: 'kicker' },
-                'Stash Interactive Plugin'
+                'button',
+                {
+                  className: 'btn btn-secondary btn-sm',
+                  onClick: function onClearError() {
+                    runtime.clearError();
+                  },
+                  type: 'button',
+                },
+                'Clear Error'
               ),
-              h('h1', { className: 'ossm-title mb-0', key: 'title' }, 'OSSM over Web Bluetooth'),
               h(
-                'p',
-                { className: 'ossm-lead text-muted mt-2 mb-0', key: 'lead' },
-                "This page controls the OSSM runtime used by Stash's interactive scene player. Set the Handy connection key to ossm to route funscript playback through this plugin while keeping the built-in Handy client available for every other key."
+                'button',
+                {
+                  className: 'btn btn-secondary btn-sm',
+                  onClick: function onClearLogs() {
+                    runtime.clearLogs();
+                  },
+                  type: 'button',
+                },
+                'Clear Logs'
               ),
-            ]),
-            h('div', { className: statusClass(snapshot.connectionStatus, snapshot.error), key: 'status' }, [
-              h('span', { className: 'ossm-status__dot', key: 'dot' }),
-              h('span', { key: 'label' }, statusLabel(snapshot)),
-            ]),
-          ]
-        ),
-
-        !snapshot.supported
-          ? h(
-              'div',
-              { className: 'alert alert-warning mb-3', key: 'unsupported' },
-              'Web Bluetooth is not available in this browser. Use a current Chromium-based browser on desktop or Android.'
-            )
-          : null,
-        snapshot.error ? h('div', { className: 'alert alert-danger mb-3', key: 'error' }, snapshot.error) : null,
-
-        h('div', { className: 'row', key: 'grid' }, [
-          showUsage
-            ? h(
-                'div',
-                { className: 'col-12 mb-3', key: 'usage' },
-                h(
-                  Card,
-                  {
-                    title: 'Usage',
-                    actions: usageLink,
-                  },
-                  [
-                    h('ol', { className: 'ossm-list text-muted mb-0', key: 'steps' }, [
-                      h('li', { key: 'one' }, 'Set the Handy connection key in Stash to ossm.'),
-                      h('li', { key: 'two' }, 'Open an interactive scene with a funscript served by Stash.'),
-                      h(
-                        'li',
-                        { key: 'three' },
-                        'Approve the Bluetooth pairing prompt the first time the browser asks for the device.'
-                      ),
-                      h(
-                        'li',
-                        { key: 'four' },
-                        'Use the controls below for fine offset, buffer, simple mode, reverse, and live device tuning.'
-                      ),
-                    ]),
-                  ]
-                )
-              )
-            : null,
-          h(
-            'div',
-            { className: 'col-xl-6 col-lg-12 mb-3', key: 'connection' },
-            h(
-              Card,
-              {
-                className: 'ossm-card--dense',
-                bodyClassName: 'p-3',
-                title: 'Connection',
-                actions: h('div', { className: 'd-flex flex-wrap align-items-center', style: { gap: '0.5rem' } }, [
-                  h(
-                    'button',
-                    {
-                      className: 'btn btn-primary btn-sm',
-                      disabled: !snapshot.supported || snapshot.connectionStatus === 'connecting',
-                      onClick: function onConnect() {
-                        runtime.connect().catch(function ignore() {
-                          return null;
-                        });
-                      },
-                      type: 'button',
-                    },
-                    connected ? 'Reconnect' : 'Connect'
-                  ),
-                  h(
-                    'button',
-                    {
-                      className: 'btn btn-secondary btn-sm',
-                      disabled: !connected,
-                      onClick: function onDisconnect() {
-                        runtime.disconnect().catch(function ignore() {
-                          return null;
-                        });
-                      },
-                      type: 'button',
-                    },
-                    'Disconnect'
-                  ),
-                ]),
-              },
-              [
-                h('div', { className: 'ossm-meta', key: 'meta' }, [
-                  h(Stat, { key: 'device', label: 'Device', value: snapshot.deviceName || 'Not paired' }),
-                  h(Stat, {
-                    key: 'key',
-                    label: 'Activation Key',
-                    value: snapshot.connectionKey || 'Set Handy key to ossm',
-                  }),
-                  h(Stat, { key: 'stash-offset', label: 'Stash Offset', value: scriptOffsetCopy }),
-                  h(Stat, { key: 'total-offset', label: 'Effective Offset', value: totalOffsetCopy }),
-                ]),
-                h('div', { className: 'ossm-actions', key: 'transport' }, [
-                  h(
-                    'button',
-                    {
-                      className: 'btn btn-secondary btn-sm',
-                      disabled: !connected,
-                      onClick: function onHome() {
-                        runtime.sendTestPosition(0).catch(function ignore() {
-                          return null;
-                        });
-                      },
-                      type: 'button',
-                    },
-                    'Home'
-                  ),
-                  h(
-                    'button',
-                    {
-                      className: 'btn btn-secondary btn-sm',
-                      disabled: !connected,
-                      onClick: function onMid() {
-                        runtime.sendTestPosition(50).catch(function ignore() {
-                          return null;
-                        });
-                      },
-                      type: 'button',
-                    },
-                    'Mid'
-                  ),
-                  h(
-                    'button',
-                    {
-                      className: 'btn btn-secondary btn-sm',
-                      disabled: !connected,
-                      onClick: function onOut() {
-                        runtime.sendTestPosition(100).catch(function ignore() {
-                          return null;
-                        });
-                      },
-                      type: 'button',
-                    },
-                    'Out'
-                  ),
-                ]),
-              ]
-            )
+            ]
           ),
-
-          h(
-            'div',
-            { className: 'col-xl-6 col-lg-12 mb-3', key: 'playback-script' },
-            h(Card, { className: 'ossm-card--dense', bodyClassName: 'p-0', title: 'Playback & Script' }, [
-              h('div', { className: 'ossm-playback', key: 'main-row' }, [
-                h('div', { className: 'ossm-meta ossm-playback__stats', key: 'stats-col' }, [
-                  h(Stat, { key: 'actions', label: 'Actions', value: String(snapshot.actionCount || 0) }),
-                  h(Stat, { key: 'simple-actions', label: 'Simple', value: String(snapshot.simpleActionCount || 0) }),
-                  h(Stat, { key: 'mode', label: 'Mode', value: settings.simpleMode ? 'Simple' : 'Full' }),
-                  h(Stat, { key: 'current-time', label: 'Video Time', value: formatMs(snapshot.currentTimeMs) }),
-                  h(Stat, { key: 'position', label: 'Target Pos', value: String(snapshot.currentPosition) + '%' }),
-                  h(Stat, { key: 'sent', label: 'Cmds Sent', value: String(snapshot.commandsSent) }),
-                ]),
-                h('div', { className: 'ossm-stat ossm-playback__script', key: 'script-col' }, [
-                  h('div', { className: 'text-muted small text-uppercase font-weight-bold mb-1', key: 'kicker' }, 'Script'),
-                  h(
-                    'div',
-                    {
-                      className: 'font-weight-bold',
-                      key: 'name',
-                      title: snapshot.currentScriptPath || 'No script loaded',
-                    },
-                    shortFileName(snapshot.currentScriptPath)
-                  ),
-                  h(
-                    'span',
-                    {
-                      className:
-                        'text-muted small d-block mt-1 ossm-playback__script-path' +
-                        (snapshot.currentScriptPath ? '' : ' ossm-playback__script-path--empty'),
-                      key: 'path',
-                      title: snapshot.currentScriptPath || '',
-                    },
-                    snapshot.currentScriptPath
-                      ? snapshot.currentScriptPath
-                      : 'No funscript has been loaded by the scene player yet.'
-                  ),
-                ]),
-              ]),
-            ])
-          ),
-
-          h(
-            'div',
-            { className: 'col-xl-6 col-lg-12 mb-3', key: 'timing' },
-            h(Card, { title: 'Timing & Behavior' }, [
-              h('div', { className: 'ossm-field-grid', key: 'fields' }, [
-                h(NumberField, {
-                  help: 'Fine tune playback on top of the Stash interface offset. Positive values send commands later.',
-                  id: 'ossm-fine-offset',
-                  key: 'offset',
-                  label: 'Fine Offset (ms)',
-                  max: 5000,
-                  min: -5000,
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ fineOffsetMs: toInteger(event.target.value, 0) }, false);
-                  },
-                  value: settings.fineOffsetMs,
-                }),
-                h(NumberField, {
-                  help: 'Extra delay also pushed into the OSSM buffer command. The sample player uses this to give the device time to receive the next movement.',
-                  id: 'ossm-buffer',
-                  key: 'buffer',
-                  label: 'Buffer (ms)',
-                  max: 1000,
-                  min: 0,
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ bufferMs: clamp(toInteger(event.target.value, 0), 0, 1000) }, true);
-                  },
-                  value: settings.bufferMs,
-                }),
-                h(ToggleField, {
-                  checked: settings.simpleMode,
-                  help: 'Send only turning points instead of every funscript action.',
-                  id: toggleId('simple-mode'),
-                  key: 'simple',
-                  label: 'Simple Mode',
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ simpleMode: Boolean(event.target.checked) }, false);
-                  },
-                }),
-                h(ToggleField, {
-                  checked: settings.reverse,
-                  help: 'Invert outgoing stream positions without modifying the funscript itself.',
-                  id: toggleId('reverse-motion'),
-                  key: 'reverse',
-                  label: 'Reverse Motion',
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ reverse: Boolean(event.target.checked) }, false);
-                  },
-                }),
-                h(ToggleField, {
-                  checked: settings.speedKnobAsLimit,
-                  help: 'Keep the physical OSSM speed knob as an upper limit for BLE speed commands.',
-                  id: toggleId('use-speed-knob-as-limit'),
-                  key: 'knob-limit',
-                  label: 'Use Speed Knob As Limit',
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ speedKnobAsLimit: Boolean(event.target.checked) }, true);
-                  },
-                }),
-                h(ToggleField, {
-                  checked: settings.latencyCompensation,
-                  help: 'Enable the OSSM latency compensation characteristic for streamed commands.',
-                  id: toggleId('latency-compensation'),
-                  key: 'latency',
-                  label: 'Latency Compensation',
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ latencyCompensation: Boolean(event.target.checked) }, true);
-                  },
-                }),
-              ]),
-            ])
-          ),
-
-          h(
-            'div',
-            { className: 'col-xl-6 col-lg-12 mb-3', key: 'device-controls' },
-            h(Card, { className: 'ossm-card--compact-controls', title: 'Device Controls' }, [
-              h('div', { className: 'ossm-field-grid', key: 'ranges' }, [
-                h(RangeField, {
-                  disabled: !connected,
-                  help: 'Live OSSM speed percentage.',
-                  id: 'ossm-speed',
-                  key: 'speed',
-                  label: 'Speed',
-                  max: 100,
-                  min: 0,
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ speed: clamp(toInteger(event.target.value, 0), 0, 100) }, true);
-                  },
-                  suffix: '%',
-                  value: settings.speed,
-                }),
-                h(RangeField, {
-                  disabled: !connected,
-                  help: 'Live OSSM stroke percentage.',
-                  id: 'ossm-stroke',
-                  key: 'stroke',
-                  label: 'Stroke',
-                  max: 100,
-                  min: 0,
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ stroke: clamp(toInteger(event.target.value, 0), 0, 100) }, true);
-                  },
-                  suffix: '%',
-                  value: settings.stroke,
-                }),
-                h(RangeField, {
-                  disabled: !connected,
-                  help: 'Live OSSM depth percentage.',
-                  id: 'ossm-depth',
-                  key: 'depth',
-                  label: 'Depth',
-                  max: 100,
-                  min: 0,
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ depth: clamp(toInteger(event.target.value, 0), 0, 100) }, true);
-                  },
-                  suffix: '%',
-                  value: settings.depth,
-                }),
-                h(RangeField, {
-                  disabled: !connected,
-                  help: 'Live OSSM sensation percentage.',
-                  id: 'ossm-sensation',
-                  key: 'sensation',
-                  label: 'Sensation',
-                  max: 100,
-                  min: 0,
-                  onChange: function onChange(event) {
-                    runtime.updateSettings({ sensation: clamp(toInteger(event.target.value, 0), 0, 100) }, true);
-                  },
-                  suffix: '%',
-                  value: settings.sensation,
-                }),
-              ]),
-            ])
-          ),
-
-          h(
-            'div',
-            { className: 'col-12 mb-3', key: 'logs' },
-            h(
-              Card,
-              {
-                title: 'Logs',
-                actions: h('div', { className: 'd-flex flex-wrap align-items-center', style: { gap: '0.5rem' } }, [
-                  h(
-                    'button',
-                    {
-                      className: 'btn btn-secondary btn-sm',
-                      onClick: function onClearError() {
-                        runtime.clearError();
-                      },
-                      type: 'button',
-                    },
-                    'Clear Error'
-                  ),
-                  h(
-                    'button',
-                    {
-                      className: 'btn btn-secondary btn-sm',
-                      onClick: function onClearLogs() {
-                        runtime.clearLogs();
-                      },
-                      type: 'button',
-                    },
-                    'Clear Logs'
-                  ),
-                ]),
-              },
-              [h('pre', { className: 'form-control ossm-log mb-0', key: 'log' }, renderLogs(snapshot.logs))]
-            )
-          ),
+          h('pre', { className: 'form-control ossm-log mb-0', key: 'log' }, renderLogs(snapshot.logs)),
         ]),
       ]),
     ]);
@@ -1556,5 +1321,41 @@
     ];
   });
 
-  PluginApi.register.route('/plugin/ossm', OssmPage);
+  PluginApi.patch.before('ScenePage.Tabs', function patchSceneTabs(props) {
+    if (!BootstrapNav || !BootstrapNav.Item || !BootstrapNav.Link) {
+      return [props];
+    }
+
+    return [
+      {
+        children: h(React.Fragment, null, [
+          props.children,
+          h(
+            BootstrapNav.Item,
+            { key: 'ossm-scene-tab-nav-item' },
+            h(BootstrapNav.Link, { eventKey: 'ossm-scene-panel', key: 'ossm-scene-tab-link' }, 'OSSM')
+          ),
+        ]),
+      },
+    ];
+  });
+
+  PluginApi.patch.before('ScenePage.TabContent', function patchSceneTabContent(props) {
+    if (!BootstrapTab || !BootstrapTab.Pane) {
+      return [props];
+    }
+
+    return [
+      {
+        children: h(React.Fragment, null, [
+          props.children,
+          h(
+            BootstrapTab.Pane,
+            { eventKey: 'ossm-scene-panel', key: 'ossm-scene-tab-content' },
+            h(OssmSceneDetailsPanel, { key: 'ossm-scene-details-panel' })
+          ),
+        ]),
+      },
+    ];
+  });
 })();

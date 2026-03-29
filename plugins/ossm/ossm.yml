@@ -1,0 +1,8 @@
+name: OSSM
+description: Control an OSSM device from Stash interactive scenes over Web Bluetooth.
+version: 0.1.0
+ui:
+  javascript:
+    - ossm.js
+  css:
+    - ossm.css

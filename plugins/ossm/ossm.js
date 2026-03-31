@@ -223,6 +223,7 @@
     var currentActionIndex = 0;
     var lastSentActionAt = -1;
     var lastObservedEffectiveTime = 0;
+    var gattOperationQueue = Promise.resolve();
 
     var state = {
       supported: typeof navigator !== 'undefined' && !!navigator.bluetooth,
@@ -289,6 +290,20 @@
       setState({ error: String(message || 'Unknown OSSM error') });
     }
 
+    function enqueueGattOperation(operation) {
+      var queuedOperation = gattOperationQueue.catch(function ignoreQueueError() {
+        return null;
+      }).then(function runQueuedOperation() {
+        return operation();
+      });
+
+      gattOperationQueue = queuedOperation.catch(function keepQueueAlive() {
+        return null;
+      });
+
+      return queuedOperation;
+    }
+
     function getActiveActions() {
       var source = state.settings.simpleMode ? state.simpleActions : state.actions;
       return Array.isArray(source) ? source : [];
@@ -329,7 +344,9 @@
         return Promise.resolve();
       }
 
-      return characteristic.writeValue(encoder.encode(value ? 'true' : 'false'));
+      return enqueueGattOperation(function writeBooleanValue() {
+        return characteristic.writeValue(encoder.encode(value ? 'true' : 'false'));
+      });
     }
 
     function sendCommand(command) {
@@ -342,7 +359,9 @@
         ? commandCharacteristic.writeValueWithoutResponse.bind(commandCharacteristic)
         : commandCharacteristic.writeValue.bind(commandCharacteristic);
 
-      return writer(payload)
+      return enqueueGattOperation(function writeCommand() {
+        return writer(payload);
+      })
         .then(function onWrite() {
           addLog('TX', command);
           return true;
@@ -415,24 +434,34 @@
       var operations = [];
 
       if (Object.prototype.hasOwnProperty.call(changes, 'speedKnobAsLimit')) {
-        operations.push(writeBooleanCharacteristic(speedKnobCharacteristic, changes.speedKnobAsLimit));
+        operations.push(function syncSpeedKnobAsLimit() {
+          return writeBooleanCharacteristic(speedKnobCharacteristic, changes.speedKnobAsLimit);
+        });
       }
 
       if (Object.prototype.hasOwnProperty.call(changes, 'latencyCompensation')) {
-        operations.push(writeBooleanCharacteristic(latencyCharacteristic, changes.latencyCompensation));
+        operations.push(function syncLatencyCompensation() {
+          return writeBooleanCharacteristic(latencyCharacteristic, changes.latencyCompensation);
+        });
       }
 
       if (Object.prototype.hasOwnProperty.call(changes, 'bufferMs')) {
-        operations.push(sendCommand('set:buffer:' + clamp(Math.round(changes.bufferMs / 2), 0, 500)));
+        operations.push(function syncBuffer() {
+          return sendCommand('set:buffer:' + clamp(Math.round(changes.bufferMs / 2), 0, 500));
+        });
       }
 
       ['speed', 'stroke', 'depth', 'sensation'].forEach(function syncKey(key) {
         if (Object.prototype.hasOwnProperty.call(changes, key)) {
-          operations.push(sendCommand('set:' + key + ':' + clamp(Math.round(changes[key]), 0, 100)));
+          operations.push(function syncSetting() {
+            return sendCommand('set:' + key + ':' + clamp(Math.round(changes[key]), 0, 100));
+          });
         }
       });
 
-      return Promise.all(operations);
+      return operations.reduce(function runSequentially(chain, operation) {
+        return chain.then(operation);
+      }, Promise.resolve());
     }
 
     function updateSettings(changes, syncToDevice) {
@@ -462,6 +491,7 @@
 
     function disconnectInternal() {
       stopSync();
+      gattOperationQueue = Promise.resolve();
 
       if (stateCharacteristic && stateListener) {
         try {
@@ -549,31 +579,38 @@
 
           addLog('INFO', 'BLE characteristics ready');
 
-          var operations = [];
+          var setup = Promise.resolve();
           if (stateCharacteristic) {
             stateListener = function onStateChange(event) {
               handleStateCharacteristic(event.target.value);
             };
 
-            operations.push(
-              stateCharacteristic
-                .readValue()
+            setup = setup.then(function readInitialState() {
+              return enqueueGattOperation(function queueStateRead() {
+                return stateCharacteristic.readValue();
+              })
                 .then(handleStateCharacteristic)
                 .catch(function ignore() {
                   return null;
-                })
-            );
-            operations.push(
-              stateCharacteristic.startNotifications().then(function subscribe() {
+                });
+            });
+
+            setup = setup.then(function enableStateNotifications() {
+              return enqueueGattOperation(function queueStartNotifications() {
+                return stateCharacteristic.startNotifications();
+              }).then(function subscribe() {
                 stateCharacteristic.addEventListener('characteristicvaluechanged', stateListener);
-              })
-            );
+              });
+            });
           }
 
-          operations.push(sendCommand('go:streaming'));
-          operations.push(applyLiveSettings(state.settings));
-
-          return Promise.all(operations);
+          return setup
+            .then(function enterStreamingMode() {
+              return sendCommand('go:streaming');
+            })
+            .then(function syncStoredSettings() {
+              return applyLiveSettings(state.settings);
+            });
         })
         .then(function onReady() {
           setState({ connectionStatus: 'connected' });

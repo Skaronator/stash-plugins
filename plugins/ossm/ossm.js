@@ -10,8 +10,12 @@
   var BootstrapNav = Bootstrap.Nav;
   var BootstrapTab = Bootstrap.Tab;
   var useEffect = React.useEffect;
+  var useRef = React.useRef;
   var useState = React.useState;
   var useSyncExternalStore = React.useSyncExternalStore;
+  var useInteractive = PluginApi.hooks && typeof PluginApi.hooks.useInteractive === 'function'
+    ? PluginApi.hooks.useInteractive
+    : null;
 
   var SERVICE_UUID = '522b443a-4f53-534d-0001-420badbabe69';
   var COMMAND_CHARACTERISTIC_UUID = '522b443a-4f53-534d-1000-420badbabe69';
@@ -19,6 +23,7 @@
   var LATENCY_CHARACTERISTIC_UUID = '522b443a-4f53-534d-1030-420badbabe69';
   var STATE_CHARACTERISTIC_UUID = '522b443a-4f53-534d-2000-420badbabe69';
   var STORAGE_KEY = 'plugin.ossm.settings';
+  var DEVICE_STORAGE_KEY = 'plugin.ossm.deviceId';
   var LOG_LIMIT = 200;
   var TICK_INTERVAL_MS = 5;
   var encoder = new window.TextEncoder();
@@ -27,33 +32,55 @@
   var DEFAULT_SETTINGS = {
     fineOffsetMs: 0,
     bufferMs: 0,
+    outputMin: 0,
+    strokeLength: 100,
     simpleMode: true,
     reverse: false,
-    speedKnobAsLimit: false,
     latencyCompensation: true,
-    speed: 0,
-    stroke: 0,
-    depth: 0,
-    sensation: 0,
+    speed: 100,
+    stroke: 50,
+    depth: 50,
+    sensation: 50,
   };
 
   function readSettings() {
     try {
       var raw = window.localStorage.getItem(STORAGE_KEY);
       if (!raw) {
-        return Object.assign({}, DEFAULT_SETTINGS);
+        return normalizeSettings(DEFAULT_SETTINGS);
       }
 
       var parsed = JSON.parse(raw);
-      return Object.assign({}, DEFAULT_SETTINGS, parsed || {});
+      return normalizeSettings(parsed || {});
     } catch (error) {
-      return Object.assign({}, DEFAULT_SETTINGS);
+      return normalizeSettings(DEFAULT_SETTINGS);
     }
   }
 
   function writeSettings(settings) {
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizeSettings(settings)));
+    } catch (error) {
+      // Ignore localStorage failures.
+    }
+  }
+
+  function readStoredDeviceId() {
+    try {
+      return String(window.localStorage.getItem(DEVICE_STORAGE_KEY) || '');
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function writeStoredDeviceId(deviceId) {
+    try {
+      if (!deviceId) {
+        window.localStorage.removeItem(DEVICE_STORAGE_KEY);
+        return;
+      }
+
+      window.localStorage.setItem(DEVICE_STORAGE_KEY, String(deviceId));
     } catch (error) {
       // Ignore localStorage failures.
     }
@@ -61,6 +88,24 @@
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+  }
+
+  function normalizeSettings(input) {
+    var source = input && typeof input === 'object' ? input : {};
+    var normalized = Object.assign({}, DEFAULT_SETTINGS, source);
+    var outputMin = clamp(toInteger(normalized.outputMin, DEFAULT_SETTINGS.outputMin), 0, 100);
+    var strokeLengthSource = Object.prototype.hasOwnProperty.call(source, 'strokeLength')
+      ? source.strokeLength
+      : Object.prototype.hasOwnProperty.call(source, 'outputMax')
+        ? toInteger(source.outputMax, 100) - outputMin
+        : DEFAULT_SETTINGS.strokeLength;
+    var strokeLength = clamp(toInteger(strokeLengthSource, DEFAULT_SETTINGS.strokeLength), 0, 100 - outputMin);
+
+    normalized.outputMin = outputMin;
+    normalized.strokeLength = strokeLength;
+    delete normalized.outputMax;
+
+    return normalized;
   }
 
   function toInteger(value, fallback) {
@@ -220,6 +265,9 @@
     var stateCharacteristic = null;
     var stateListener = null;
     var syncInterval = null;
+    var idlePreviewTimer = null;
+    var pendingIdlePreviewPosition = null;
+    var idlePreviewInFlight = false;
     var currentActionIndex = 0;
     var lastSentActionAt = -1;
     var lastObservedEffectiveTime = 0;
@@ -243,6 +291,7 @@
       isPlaying: false,
       looping: false,
       deviceState: null,
+      streamingReady: false,
     };
 
     function emit() {
@@ -337,6 +386,39 @@
 
       var currentTime = Number(player.currentTime());
       return Number.isFinite(currentTime) ? currentTime * 1000 : null;
+    }
+
+    function getOutputRange() {
+      var rawMin = clamp(toInteger(state.settings.outputMin, 0), 0, 100);
+      var strokeLength = clamp(toInteger(state.settings.strokeLength, 100), 0, 100 - rawMin);
+      return {
+        min: rawMin,
+        max: rawMin + strokeLength,
+      };
+    }
+
+    function mapOutputPosition(position) {
+      var range = getOutputRange();
+      var normalized = clamp(Number(position), 0, 100) / 100;
+      return Math.round(range.min + normalized * (range.max - range.min));
+    }
+
+    function getStreamTargetPosition(position) {
+      var mappedPosition = mapOutputPosition(position);
+      if (!state.settings.reverse) {
+        return mappedPosition;
+      }
+
+      return clamp(100 - mappedPosition, 0, 100);
+    }
+
+    function getIdlePreviewTargetPosition() {
+      var range = getOutputRange();
+      if (!state.settings.reverse) {
+        return range.max;
+      }
+
+      return clamp(100 - range.max, 0, 100);
     }
 
     function getEffectivePlaybackTime(playbackMs) {
@@ -437,20 +519,46 @@
         nextSettings.bufferMs = clamp(Math.round(Number(deviceState.buffer) * 2), 0, 1000);
       }
 
-      var mergedSettings = Object.assign({}, state.settings, nextSettings);
+      var desiredSettings = state.settings;
+      var wasStreamingReady = state.streamingReady;
+      var mergedSettings = normalizeSettings(Object.assign({}, state.settings, nextSettings));
+      var deviceMode = String(deviceState.state || '');
+      var streamingReady = deviceMode === 'streaming.idle' || deviceMode === 'streaming';
       writeSettings(mergedSettings);
       setState({
         deviceState: deviceState,
         settings: mergedSettings,
+        streamingReady: streamingReady,
       });
+
+      if (streamingReady && !wasStreamingReady) {
+        writeBooleanCharacteristic(speedKnobCharacteristic, false)
+          .then(function syncStreamingSettingsAfterIdle() {
+            return applyLiveSettings({
+              latencyCompensation: desiredSettings.latencyCompensation,
+              bufferMs: desiredSettings.bufferMs,
+              speed: clamp(Math.round(desiredSettings.speed || 100), 1, 100),
+              sensation: clamp(Math.round(desiredSettings.sensation || 50), 1, 100),
+            });
+          })
+          .catch(function onStreamingSettingsSyncError(error) {
+            setError(error && error.message ? error.message : error);
+            addLog('ERR', 'Streaming settings sync failed: ' + (error && error.message ? error.message : error));
+          });
+      }
     }
 
     function handleStateCharacteristic(value) {
       var text = decodeCharacteristicValue(value);
       addLog('RX', 'state: ' + text);
 
+      var trimmedText = String(text || '').trim();
+      if (!trimmedText || (trimmedText.charAt(0) !== '{' && trimmedText.charAt(0) !== '[')) {
+        return;
+      }
+
       try {
-        applyDeviceState(JSON.parse(text));
+        applyDeviceState(JSON.parse(trimmedText));
       } catch (error) {
         addLog('ERR', 'State parse failed: ' + error.message);
       }
@@ -458,12 +566,6 @@
 
     function applyLiveSettings(changes) {
       var operations = [];
-
-      if (Object.prototype.hasOwnProperty.call(changes, 'speedKnobAsLimit')) {
-        operations.push(function syncSpeedKnobAsLimit() {
-          return writeBooleanCharacteristic(speedKnobCharacteristic, changes.speedKnobAsLimit);
-        });
-      }
 
       if (Object.prototype.hasOwnProperty.call(changes, 'latencyCompensation')) {
         operations.push(function syncLatencyCompensation() {
@@ -491,9 +593,18 @@
     }
 
     function updateSettings(changes, syncToDevice) {
-      var nextSettings = Object.assign({}, state.settings, changes || {});
+      var previousSettings = state.settings;
+      var nextSettings = normalizeSettings(Object.assign({}, state.settings, changes || {}));
       writeSettings(nextSettings);
       setState({ settings: nextSettings });
+
+      if (
+        changes &&
+        Object.prototype.hasOwnProperty.call(changes, 'outputMin') &&
+        nextSettings.outputMin !== previousSettings.outputMin
+      ) {
+        queueIdlePreviewPosition(getIdlePreviewTargetPosition());
+      }
 
       if (syncToDevice && state.connectionStatus === 'connected') {
         return applyLiveSettings(changes || {}).catch(function onSyncError(error) {
@@ -515,8 +626,74 @@
       }
     }
 
+    function clearIdlePreviewTimer() {
+      if (idlePreviewTimer) {
+        window.clearTimeout(idlePreviewTimer);
+        idlePreviewTimer = null;
+      }
+    }
+
+    function cancelIdlePreview() {
+      clearIdlePreviewTimer();
+      pendingIdlePreviewPosition = null;
+    }
+
+    function canPreviewIdlePosition() {
+      return Boolean(
+        server &&
+        server.connected &&
+        state.connectionStatus === 'connected' &&
+        state.streamingReady &&
+        !state.isPlaying
+      );
+    }
+
+    function flushIdlePreview() {
+      if (idlePreviewInFlight || pendingIdlePreviewPosition == null) {
+        return;
+      }
+
+      if (!canPreviewIdlePosition()) {
+        pendingIdlePreviewPosition = null;
+        return;
+      }
+
+      var targetPosition = clamp(toInteger(pendingIdlePreviewPosition, state.currentPosition || 0), 0, 100);
+      var currentPosition = clamp(toInteger(state.currentPosition, targetPosition), 0, 100);
+      var distance = Math.abs(targetPosition - currentPosition);
+      var durationMs = clamp(Math.max(600, distance * 25), 600, 3000);
+
+      pendingIdlePreviewPosition = null;
+      idlePreviewInFlight = true;
+
+      sendStreamPosition(targetPosition, durationMs)
+        .catch(function ignoreIdlePreviewError() {
+          return false;
+        })
+        .finally(function onIdlePreviewSettled() {
+          idlePreviewInFlight = false;
+          if (pendingIdlePreviewPosition != null) {
+            flushIdlePreview();
+          }
+        });
+    }
+
+    function queueIdlePreviewPosition(position) {
+      if (!canPreviewIdlePosition()) {
+        return;
+      }
+
+      pendingIdlePreviewPosition = clamp(toInteger(position, 0), 0, 100);
+      clearIdlePreviewTimer();
+      idlePreviewTimer = window.setTimeout(function runIdlePreview() {
+        idlePreviewTimer = null;
+        flushIdlePreview();
+      }, 75);
+    }
+
     function disconnectInternal() {
       stopSync();
+      cancelIdlePreview();
       gattOperationQueue = Promise.resolve();
 
       if (stateCharacteristic && stateListener) {
@@ -538,6 +715,7 @@
       setState({
         connectionStatus: 'disconnected',
         deviceName: '',
+        streamingReady: false,
       });
       addLog('INFO', 'Device disconnected');
     }
@@ -546,38 +724,25 @@
       disconnectInternal();
     }
 
-    function connect() {
-      if (!state.supported) {
-        var supportError = new Error('Web Bluetooth is not supported by this browser');
-        setError(supportError.message);
-        return Promise.reject(supportError);
+    function connectToDevice(selectedDevice) {
+      if (!selectedDevice) {
+        return Promise.reject(new Error('No OSSM device selected'));
       }
 
-      if (state.connectionStatus === 'connecting') {
-        return Promise.resolve();
+      device = selectedDevice;
+      try {
+        device.removeEventListener('gattserverdisconnected', onGattDisconnected);
+      } catch (error) {
+        // Ignore listener cleanup failures.
       }
-
-      if (server && server.connected) {
-        setState({ connectionStatus: 'connected' });
-        return Promise.resolve();
+      device.addEventListener('gattserverdisconnected', onGattDisconnected);
+      if (device.id) {
+        writeStoredDeviceId(device.id);
       }
+      setState({ deviceName: device.name || 'OSSM' });
+      addLog('INFO', 'Selected device: ' + (device.name || 'OSSM'));
 
-      clearError();
-      setState({ connectionStatus: 'connecting' });
-      addLog('INFO', 'Requesting OSSM device');
-
-      return navigator.bluetooth
-        .requestDevice({
-          filters: [{ services: [SERVICE_UUID] }],
-          optionalServices: [SERVICE_UUID],
-        })
-        .then(function onDeviceSelected(selectedDevice) {
-          device = selectedDevice;
-          device.addEventListener('gattserverdisconnected', onGattDisconnected);
-          setState({ deviceName: device.name || 'OSSM' });
-          addLog('INFO', 'Selected device: ' + (device.name || 'OSSM'));
-          return device.gatt.connect();
-        })
+      return device.gatt.connect()
         .then(function onServerConnected(connectedServer) {
           server = connectedServer;
           addLog('INFO', 'Connected to GATT server');
@@ -634,13 +799,97 @@
             .then(function enterStreamingMode() {
               return sendCommand('go:streaming');
             })
-            .then(function syncStoredSettings() {
-              return applyLiveSettings(state.settings);
+            .then(function syncStreamingSettings() {
+              return writeBooleanCharacteristic(speedKnobCharacteristic, false).then(function syncAfterDisableSpeedKnobLimit() {
+                return applyLiveSettings({
+                  latencyCompensation: state.settings.latencyCompensation,
+                  bufferMs: state.settings.bufferMs,
+                  speed: clamp(Math.round(state.settings.speed || 100), 1, 100),
+                  sensation: clamp(Math.round(state.settings.sensation || 50), 1, 100),
+                });
+              });
             });
         })
         .then(function onReady() {
           setState({ connectionStatus: 'connected' });
-          addLog('INFO', 'OSSM is ready for streaming mode');
+          addLog('INFO', 'OSSM BLE session is ready; waiting for streaming.idle');
+          return true;
+        });
+    }
+
+    function reconnectKnownDevice() {
+      if (!navigator.bluetooth || typeof navigator.bluetooth.getDevices !== 'function') {
+        return Promise.resolve(false);
+      }
+
+      var storedDeviceId = readStoredDeviceId();
+      return navigator.bluetooth.getDevices().then(function onDevices(devices) {
+        if (!Array.isArray(devices) || devices.length === 0) {
+          return false;
+        }
+
+        var knownDevice = null;
+        if (storedDeviceId) {
+          knownDevice = devices.find(function findStoredDevice(candidate) {
+            return candidate && candidate.id === storedDeviceId;
+          }) || null;
+        }
+
+        if (!knownDevice) {
+          knownDevice = devices.find(function findNamedDevice(candidate) {
+            return candidate && candidate.name === 'OSSM';
+          }) || devices[0] || null;
+        }
+
+        if (!knownDevice) {
+          return false;
+        }
+
+        addLog('INFO', 'Reconnecting to previously granted device: ' + (knownDevice.name || 'OSSM'));
+        return connectToDevice(knownDevice);
+      }).catch(function onReconnectError(error) {
+        addLog('ERR', 'Reconnect failed: ' + (error && error.message ? error.message : error));
+        return false;
+      });
+    }
+
+    function connect(options) {
+      if (!state.supported) {
+        var supportError = new Error('Web Bluetooth is not supported by this browser');
+        setError(supportError.message);
+        return Promise.reject(supportError);
+      }
+
+      var allowRequest = !options || options.allowRequest !== false;
+
+      if (state.connectionStatus === 'connecting') {
+        return Promise.resolve();
+      }
+
+      if (server && server.connected) {
+        setState({ connectionStatus: 'connected' });
+        return Promise.resolve();
+      }
+
+      clearError();
+      setState({ connectionStatus: 'connecting', streamingReady: false });
+      addLog('INFO', allowRequest ? 'Requesting OSSM device' : 'Trying previously granted OSSM device');
+
+      return reconnectKnownDevice()
+        .then(function onReconnectAttempt(reconnected) {
+          if (reconnected || !allowRequest) {
+            if (!reconnected && !allowRequest) {
+              setState({ connectionStatus: 'disconnected' });
+            }
+            return reconnected;
+          }
+
+          return navigator.bluetooth.requestDevice({
+            filters: [{ services: [SERVICE_UUID] }],
+            optionalServices: [SERVICE_UUID],
+          }).then(function onDeviceSelected(selectedDevice) {
+            return connectToDevice(selectedDevice);
+          });
         })
         .catch(function onConnectError(error) {
           setState({ connectionStatus: 'disconnected' });
@@ -692,7 +941,7 @@
         var nextAction = actions[currentActionIndex + 1];
         if (currentAction.at > lastSentActionAt) {
           (function queueAction(action, upcomingAction) {
-            var targetPosition = state.settings.reverse ? 100 - upcomingAction.pos : upcomingAction.pos;
+            var targetPosition = getStreamTargetPosition(upcomingAction.pos);
             var duration = Math.max(0, upcomingAction.at - action.at);
             chain = chain.then(function runAction() {
               return sendStreamPosition(targetPosition, duration);
@@ -713,6 +962,7 @@
         playbackMs = getPlayerTimeMs() || 0;
       }
 
+      cancelIdlePreview();
       resetPlayback(playbackMs);
       setState({ isPlaying: true });
       processPlayback(playbackMs);
@@ -807,7 +1057,26 @@
         return Promise.resolve();
       }
 
-      return connect().then(function onConnected() {
+      return connect({ allowRequest: false }).then(function onConnected() {
+        if (!server || !server.connected || state.connectionStatus !== 'connected') {
+          setError('Connect the OSSM from the plugin button before starting playback');
+          addLog('ERR', 'Playback requested while OSSM is not connected');
+          return;
+        }
+
+        if (!state.streamingReady) {
+          var currentMode = state.deviceState && state.deviceState.state ? String(state.deviceState.state) : '';
+          if (currentMode === 'streaming.preflight') {
+            setError('OSSM is in streaming preflight. Turn the physical speed knob to 0 until it reaches streaming.idle.');
+            addLog('ERR', 'Playback blocked: OSSM is waiting for the physical speed knob to reach 0');
+            return;
+          }
+
+          setError('OSSM is still entering streaming mode. Wait for streaming.idle before playback.');
+          addLog('ERR', 'Playback requested before OSSM reached streaming.idle');
+          return;
+        }
+
         startSync(positionSeconds);
       });
     }
@@ -870,7 +1139,7 @@
       },
       clearError: clearError,
       sync: function sync() {
-        return Promise.resolve(0);
+        return Promise.resolve(1);
       },
       isEnabled: isEnabled,
     };
@@ -908,7 +1177,7 @@
     if (!this._store.isEnabled()) {
       return Promise.resolve();
     }
-    return this._store.connect();
+    return this._store.connect({ allowRequest: false });
   };
 
   OssmInteractiveClient.prototype.uploadScript = function uploadScript(funscriptPath) {
@@ -1018,6 +1287,42 @@
     return this._active().setLooping(looping);
   };
 
+  function OssmInteractiveBootstrap() {
+    var interactiveState = useInteractive ? useInteractive() : null;
+    var bootstrapPendingRef = useRef(false);
+
+    useEffect(function bootstrapInteractiveState() {
+      if (!interactiveState || !interactiveState.interactive) {
+        return;
+      }
+
+      if (interactiveState.interactive.handyKey !== 'ossm' || interactiveState.initialised) {
+        bootstrapPendingRef.current = false;
+        return;
+      }
+
+      if (!interactiveState.serverOffset || bootstrapPendingRef.current) {
+        return;
+      }
+
+      bootstrapPendingRef.current = true;
+      Promise.resolve(interactiveState.initialise())
+        .catch(function ignore() {
+          return null;
+        })
+        .finally(function clearBootstrapPending() {
+          bootstrapPendingRef.current = false;
+        });
+    }, [
+      interactiveState ? interactiveState.initialised : false,
+      interactiveState ? interactiveState.initialise : null,
+      interactiveState && interactiveState.interactive ? interactiveState.interactive.handyKey : '',
+      interactiveState ? interactiveState.serverOffset : 0,
+    ]);
+
+    return null;
+  }
+
   function useRuntimeSnapshot() {
     if (typeof useSyncExternalStore === 'function') {
       return useSyncExternalStore(runtime.subscribe, runtime.getSnapshot, runtime.getSnapshot);
@@ -1056,6 +1361,62 @@
         step: props.step || 1,
         type: 'number',
         value: props.value,
+      }),
+      props.help ? h('small', { className: 'form-text text-muted mt-1 mb-0', key: 'help' }, props.help) : null,
+    ]);
+  }
+
+  function SliderField(props) {
+    var liveValueState = useState(props.value);
+    var liveValue = liveValueState[0];
+    var setLiveValue = liveValueState[1];
+
+    useEffect(function syncSliderValue() {
+      setLiveValue(props.value);
+    }, [props.value]);
+
+    function commitValue(nextValue) {
+      if (typeof props.onCommit === 'function') {
+        props.onCommit(nextValue);
+      }
+    }
+
+    function handleLiveChange(nextValue) {
+      setLiveValue(nextValue);
+      if (props.commitOnChange) {
+        commitValue(nextValue);
+      }
+    }
+
+    return h('div', { className: 'form-group mb-0 ossm-field' }, [
+      h('div', { className: 'd-flex align-items-center justify-content-between mb-1', key: 'header' }, [
+        h('label', { className: 'mb-0', htmlFor: props.id, key: 'label' }, props.label),
+        h('span', { className: 'ossm-slider__value text-muted', key: 'value' }, String(liveValue) + (props.unit || '')),
+      ]),
+      h('input', {
+        className: 'custom-range ossm-slider',
+        id: props.id,
+        key: 'input',
+        max: props.max,
+        min: props.min,
+        onBlur: function onBlur(event) {
+          commitValue(event.target.value);
+        },
+        onChange: function onChange(event) {
+          handleLiveChange(toInteger(event.target.value, props.value));
+        },
+        onKeyUp: function onKeyUp(event) {
+          commitValue(event.target.value);
+        },
+        onMouseUp: function onMouseUp(event) {
+          commitValue(event.target.value);
+        },
+        onTouchEnd: function onTouchEnd(event) {
+          commitValue(event.target.value);
+        },
+        step: props.step || 1,
+        type: 'range',
+        value: liveValue,
       }),
       props.help ? h('small', { className: 'form-text text-muted mt-1 mb-0', key: 'help' }, props.help) : null,
     ]);
@@ -1278,9 +1639,86 @@
           value: String(snapshot.commandsSent || 0),
         }),
       ]),
+      h('div', { className: 'mt-3', key: 'motion-limits' }, [
+        h('h5', { className: 'mb-3', key: 'motion-title' }, 'Motion Limits'),
+        h('div', { className: 'ossm-field-grid', key: 'motion-fields' }, [
+          h(SliderField, {
+            help: 'BLE speed cap for streaming mode. Set to 0 to intentionally stop motion.',
+            id: 'ossm-scene-speed',
+            key: 'speed',
+            label: 'Speed Limit (%)',
+            max: 100,
+            min: 0,
+            onCommit: function onCommit(value) {
+              runtime.updateSettings({ speed: clamp(toInteger(value, 100), 0, 100) }, true);
+            },
+            unit: '%',
+            value: settings.speed,
+          }),
+          h(SliderField, {
+            help: 'Minimum streamed depth after remapping the funscript range. 0 is fully retracted.',
+            id: 'ossm-scene-output-min',
+            key: 'output-min',
+            label: 'Min Depth (%)',
+            max: 100,
+            min: 0,
+            onCommit: function onCommit(value) {
+              runtime.updateSettings(
+                { outputMin: clamp(toInteger(value, 0), 0, 100 - clamp(toInteger(settings.strokeLength, 100), 0, 100)) },
+                false
+              );
+            },
+            commitOnChange: true,
+            unit: '%',
+            value: settings.outputMin,
+          }),
+          h(SliderField, {
+            help: 'Stroke length added on top of the minimum depth. Effective max depth is min depth plus stroke length.',
+            id: 'ossm-scene-stroke-length',
+            key: 'stroke-length',
+            label: 'Stroke Length (%)',
+            max: 100,
+            min: 0,
+            onCommit: function onCommit(value) {
+              runtime.updateSettings(
+                { strokeLength: clamp(toInteger(value, 100), 0, 100 - clamp(toInteger(settings.outputMin, 0), 0, 100)) },
+                false
+              );
+            },
+            commitOnChange: true,
+            unit: '%',
+            value: settings.strokeLength,
+          }),
+        ]),
+      ]),
       h('div', { className: 'mt-3', key: 'timing-behavior' }, [
         h('h5', { className: 'mb-3', key: 'timing-title' }, 'Timing & Behavior'),
         h('div', { className: 'ossm-field-grid', key: 'timing-fields' }, [
+          h(ToggleField, {
+            checked: settings.simpleMode,
+            help: 'Send only turning points instead of every funscript action.',
+            id: toggleId('scene-simple-mode'),
+            key: 'simple',
+            label: 'Simple Mode',
+            onChange: function onChange(event) {
+              runtime.updateSettings({ simpleMode: Boolean(event.target.checked) }, false);
+            },
+          }),
+          h(ToggleField, {
+            checked: settings.reverse,
+            help: 'Invert outgoing stream positions without modifying the funscript itself.',
+            id: toggleId('scene-reverse-motion'),
+            key: 'reverse',
+            label: 'Reverse Motion',
+            onChange: function onChange(event) {
+              runtime.updateSettings({ reverse: Boolean(event.target.checked) }, false);
+            },
+          }),
+        ]),
+      ]),
+      h('details', { className: 'ossm-scene-panel__debug mt-3', key: 'advanced-options' }, [
+        h('summary', { className: 'ossm-scene-panel__debug-summary', key: 'advanced-summary' }, 'Advanced Options'),
+        h('div', { className: 'mt-3 ossm-field-grid', key: 'advanced-fields' }, [
           h(NumberField, {
             help: 'Fine tune playback on top of the Stash interface offset. Positive values send commands later.',
             id: 'ossm-scene-fine-offset',
@@ -1304,36 +1742,6 @@
               runtime.updateSettings({ bufferMs: clamp(toInteger(event.target.value, 0), 0, 1000) }, true);
             },
             value: settings.bufferMs,
-          }),
-          h(ToggleField, {
-            checked: settings.simpleMode,
-            help: 'Send only turning points instead of every funscript action.',
-            id: toggleId('scene-simple-mode'),
-            key: 'simple',
-            label: 'Simple Mode',
-            onChange: function onChange(event) {
-              runtime.updateSettings({ simpleMode: Boolean(event.target.checked) }, false);
-            },
-          }),
-          h(ToggleField, {
-            checked: settings.reverse,
-            help: 'Invert outgoing stream positions without modifying the funscript itself.',
-            id: toggleId('scene-reverse-motion'),
-            key: 'reverse',
-            label: 'Reverse Motion',
-            onChange: function onChange(event) {
-              runtime.updateSettings({ reverse: Boolean(event.target.checked) }, false);
-            },
-          }),
-          h(ToggleField, {
-            checked: settings.speedKnobAsLimit,
-            help: 'Keep the physical OSSM speed knob as an upper limit for BLE speed commands.',
-            id: toggleId('scene-use-speed-knob-as-limit'),
-            key: 'knob-limit',
-            label: 'Use Speed Knob As Limit',
-            onChange: function onChange(event) {
-              runtime.updateSettings({ speedKnobAsLimit: Boolean(event.target.checked) }, true);
-            },
           }),
           h(ToggleField, {
             checked: settings.latencyCompensation,
@@ -1397,7 +1805,11 @@
   PluginApi.patch.before('MainNavBar.UtilityItems', function patchUtilityItems(props) {
     return [
       {
-        children: h(React.Fragment, null, [props.children, h(OssmNavButton, { key: 'ossm-navbar-button' })]),
+        children: h(React.Fragment, null, [
+          props.children,
+          h(OssmInteractiveBootstrap, { key: 'ossm-interactive-bootstrap' }),
+          h(OssmNavButton, { key: 'ossm-navbar-button' }),
+        ]),
       },
     ];
   });

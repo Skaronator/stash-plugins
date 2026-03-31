@@ -54,6 +54,23 @@
   gap: 0.35rem;
 }
 
+.ossm-field .form-text {
+  margin-top: 0.25rem !important;
+}
+
+.ossm-slider {
+  margin: 0 !important;
+  width: 100%;
+}
+
+.ossm-slider__value {
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+  margin-left: 0.75rem;
+  line-height: 1;
+  white-space: nowrap;
+}
+
 .ossm-toggle {
   gap: 1rem;
 }

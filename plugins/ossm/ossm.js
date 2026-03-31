@@ -304,6 +304,26 @@
       return queuedOperation;
     }
 
+    function getCharacteristicWriter(characteristic) {
+      if (!characteristic) {
+        return null;
+      }
+
+      if (typeof characteristic.writeValueWithResponse === 'function') {
+        return characteristic.writeValueWithResponse.bind(characteristic);
+      }
+
+      if (typeof characteristic.writeValue === 'function') {
+        return characteristic.writeValue.bind(characteristic);
+      }
+
+      if (typeof characteristic.writeValueWithoutResponse === 'function') {
+        return characteristic.writeValueWithoutResponse.bind(characteristic);
+      }
+
+      return null;
+    }
+
     function getActiveActions() {
       var source = state.settings.simpleMode ? state.simpleActions : state.actions;
       return Array.isArray(source) ? source : [];
@@ -344,8 +364,13 @@
         return Promise.resolve();
       }
 
+      var writer = getCharacteristicWriter(characteristic);
+      if (!writer) {
+        return Promise.reject(new Error('Characteristic does not support writes'));
+      }
+
       return enqueueGattOperation(function writeBooleanValue() {
-        return characteristic.writeValue(encoder.encode(value ? 'true' : 'false'));
+        return writer(encoder.encode(value ? 'true' : 'false'));
       });
     }
 
@@ -355,9 +380,10 @@
       }
 
       var payload = encoder.encode(command);
-      var writer = commandCharacteristic.writeValueWithoutResponse
-        ? commandCharacteristic.writeValueWithoutResponse.bind(commandCharacteristic)
-        : commandCharacteristic.writeValue.bind(commandCharacteristic);
+      var writer = getCharacteristicWriter(commandCharacteristic);
+      if (!writer) {
+        return Promise.reject(new Error('Command characteristic does not support writes'));
+      }
 
       return enqueueGattOperation(function writeCommand() {
         return writer(payload);
